@@ -386,13 +386,14 @@ fn parse_session(
         }
     }
 
-    // Get matching lines - prefer user/assistant text over tool calls
+    // Get matching lines - prefer user/assistant text, fall back to any entry
     let raw_matches = ripgrep_matching_lines(file, terms, ignore_case, context_lines);
-    let matching_lines: Vec<MatchLine> = raw_matches
+
+    // First pass: only user/assistant messages with real text
+    let mut matching_lines: Vec<MatchLine> = raw_matches
         .iter()
         .filter_map(|raw_line| {
             let entry: JsonlEntry = serde_json::from_str(raw_line).ok()?;
-            // Skip non-message types (progress, system, etc.)
             let entry_type = entry.entry_type.as_deref()?;
             if entry_type != "user" && entry_type != "assistant" {
                 return None;
@@ -403,7 +404,6 @@ fn parse_session(
             if text.is_empty() || text.starts_with("[tool:") {
                 return None;
             }
-            // Skip task notifications and system noise
             if text.starts_with("<task-notification>") || text.starts_with("<system-reminder>") {
                 return None;
             }
@@ -417,6 +417,34 @@ fn parse_session(
         })
         .take(context_lines)
         .collect();
+
+    // Fallback: if no user/assistant matches, search the raw JSONL for context
+    if matching_lines.is_empty() {
+        matching_lines = raw_matches
+            .iter()
+            .filter_map(|raw_line| {
+                // Extract match context directly from the raw JSON line
+                let display = find_match_context(raw_line, terms, ignore_case, 150);
+                // Clean up JSON artifacts from the snippet
+                let display = display
+                    .replace("\\n", " ")
+                    .replace("\\t", " ")
+                    .replace("\\\"", "\"");
+                if display.is_empty() {
+                    return None;
+                }
+                let entry_type = serde_json::from_str::<JsonlEntry>(raw_line)
+                    .ok()
+                    .and_then(|e| e.entry_type)
+                    .unwrap_or_else(|| "?".to_string());
+                Some(MatchLine {
+                    role: entry_type,
+                    text: display,
+                })
+            })
+            .take(context_lines)
+            .collect();
+    }
 
     Some(SessionInfo {
         session_id,
@@ -637,7 +665,9 @@ fn display_session(session: &SessionInfo, index: usize, _pid_map: &HashMap<Strin
             let role_tag = match m.role.as_str() {
                 "user" => "user".cyan().to_string(),
                 "assistant" => "asst".green().to_string(),
-                _ => "sys".dimmed().to_string(),
+                "progress" => "tool".yellow().to_string(),
+                "system" => "sys".dimmed().to_string(),
+                other => other.dimmed().to_string(),
             };
             println!("    [{}] {}", role_tag, m.text);
         }
