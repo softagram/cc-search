@@ -162,7 +162,9 @@ Claude Code stores conversation data in `~/.claude/`:
 └── projects/
     ├── -Users-<user>-code-<project>/
     │   ├── <session-uuid>.jsonl        # Conversation log (one JSON object per line)
-    │   ├── agent-<hash>.jsonl          # Subagent conversation logs
+    │   ├── <session-uuid>/
+    │   │   └── subagents/
+    │   │       └── agent-<hash>.jsonl  # Subagent conversation logs
     │   └── memory/                     # Project memory files
     └── ...
 ```
