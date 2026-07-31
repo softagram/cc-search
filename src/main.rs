@@ -65,6 +65,8 @@ struct JsonlEntry {
     session_id: Option<String>,
     #[serde(rename = "customTitle")]
     custom_title: Option<String>,
+    #[serde(rename = "aiTitle")]
+    ai_title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -296,6 +298,7 @@ fn parse_session(
     let mut compacted = false;
     let mut compaction_count = 0usize;
     let mut custom_title: Option<String> = None;
+    let mut ai_title: Option<String> = None;
     let mut cwd: Option<String> = None;
 
     for line in content.lines() {
@@ -323,6 +326,12 @@ fn parse_session(
         if entry.entry_type.as_deref() == Some("custom-title") {
             if let Some(title) = &entry.custom_title {
                 custom_title = Some(title.clone());
+            }
+        }
+
+        if entry.entry_type.as_deref() == Some("ai-title") {
+            if let Some(title) = &entry.ai_title {
+                ai_title = Some(title.clone());
             }
         }
 
@@ -451,7 +460,7 @@ fn parse_session(
         project,
         file_path: file.to_path_buf(),
         cwd,
-        custom_title,
+        custom_title: custom_title.or(ai_title),
         first_user_msg,
         last_user_msg,
         last_assistant_msg,
