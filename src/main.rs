@@ -3,7 +3,6 @@ use clap::Parser;
 use colored::Colorize;
 use rayon::prelude::*;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -42,15 +41,6 @@ struct Cli {
 }
 
 // --- Data model ---
-
-#[derive(Deserialize)]
-struct SessionPid {
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    cwd: Option<String>,
-    #[serde(rename = "startedAt")]
-    started_at: Option<u64>,
-}
 
 #[derive(Deserialize)]
 struct JsonlEntry {
@@ -527,31 +517,6 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
-// --- PID session map ---
-
-fn load_pid_sessions(claude_dir: &Path) -> HashMap<String, SessionPid> {
-    let sessions_dir = claude_dir.join("sessions");
-    let mut map = HashMap::new();
-
-    let entries = match std::fs::read_dir(&sessions_dir) {
-        Ok(e) => e,
-        Err(_) => return map,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(pid_session) = serde_json::from_str::<SessionPid>(&content) {
-                    map.insert(pid_session.session_id.clone(), pid_session);
-                }
-            }
-        }
-    }
-
-    map
-}
-
 // --- Display ---
 
 fn format_timestamp(ts: &DateTime<Utc>) -> String {
@@ -571,7 +536,7 @@ fn format_duration(first: &DateTime<Utc>, last: &DateTime<Utc>) -> String {
     }
 }
 
-fn display_session(session: &SessionInfo, index: usize, _pid_map: &HashMap<String, SessionPid>) {
+fn display_session(session: &SessionInfo, index: usize) {
     let divider = "─".repeat(80);
     println!("{}", divider.dimmed());
 
@@ -810,9 +775,6 @@ fn main() {
         return;
     }
 
-    // Load PID metadata
-    let pid_map = load_pid_sessions(&claude_dir);
-
     // Parse in parallel
     let mut sessions: Vec<SessionInfo> = all_matches
         .par_iter()
@@ -825,7 +787,7 @@ fn main() {
     // Display
     let show_count = sessions.len().min(cli.max_results);
     for (i, session) in sessions.iter().take(show_count).enumerate() {
-        display_session(session, i, &pid_map);
+        display_session(session, i);
     }
 
     let divider = "─".repeat(80);
