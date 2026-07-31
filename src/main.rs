@@ -275,11 +275,23 @@ fn extract_text_content(content: &serde_json::Value) -> String {
 
 fn parse_session(
     file: &Path,
+    projects_dir: &Path,
     terms: &[String],
     ignore_case: bool,
     context_lines: usize,
 ) -> Option<SessionInfo> {
-    let project = file.parent()?.file_name()?.to_string_lossy().to_string();
+    // Session files can be nested below the project directory (subagent logs
+    // live in <project>/<session-uuid>/subagents/agent-*.jsonl), so the project
+    // is the first path component under the projects directory — not the
+    // file's immediate parent.
+    let project = file
+        .strip_prefix(projects_dir)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .or_else(|| {
+            Some(file.parent()?.file_name()?.to_string_lossy().to_string())
+        })?;
 
     let session_id = file.file_stem()?.to_string_lossy().to_string();
 
@@ -816,7 +828,7 @@ fn main() {
     // Parse in parallel
     let mut sessions: Vec<SessionInfo> = all_matches
         .par_iter()
-        .filter_map(|f| parse_session(f, &cli.terms, ignore_case, cli.context_lines))
+        .filter_map(|f| parse_session(f, &projects_dir, &cli.terms, ignore_case, cli.context_lines))
         .collect();
 
     // Sort by last timestamp (most recent first)
