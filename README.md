@@ -116,7 +116,7 @@ Each matching session is displayed as a card:
 
 | Field | Description |
 |-------|-------------|
-| **#N + Title** | Result rank and session's custom title (if set via Claude Code). |
+| **#N + Title** | Result rank and session title: the custom title if set via Claude Code, otherwise the auto-generated AI title. |
 | **Project** | Human-readable project name, derived from the directory path. |
 | **Session ID** | UUID used with `claude --resume`. |
 | **CWD** | Working directory the session was started in. |
