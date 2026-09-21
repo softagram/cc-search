@@ -72,7 +72,35 @@ cc-search [OPTIONS] <TERMS>...
 | `-c`, `--context-lines` | 3 | Number of matching message excerpts to show per session. |
 | `-p`, `--project` | all | Filter to sessions from a specific project (substring match on project directory name). |
 | `--include-agents` | off | Include subagent/agent sessions (excluded by default). |
+| `--sort` | `recency` | Result ordering: `recency` (most recently active first) or `hits` (most matches first). |
+| `--tools` | off | Also match tool calls, tool output and session titles, not just prose. |
+| `--all` | off | Match anything in the transcript, including auto-injected boilerplate. |
 | `--claude-dir` | `~/.claude` | Override the Claude configuration directory. |
+
+#### Match tiers
+
+A session `.jsonl` contains far more than the conversation. Claude Code injects the
+skill listing, `CLAUDE.md`, hook output, token reminders and file-history snapshots
+into *every* transcript, so a raw substring hit says nothing about whether the
+session was actually *about* the term. On one real archive, searching for a
+customer name matched 560 sessions — 312 of them only because an unrelated
+`create-acme-invoice` skill description mentioned the word.
+
+Every transcript entry is therefore classified into a tier, and a session is only
+reported if it has a hit at or above the requested tier:
+
+| Tier | Contains | Included by |
+|------|----------|-------------|
+| **prose** | User text, assistant text, assistant thinking (with `<system-reminder>` spans stripped) | default, `--tools`, `--all` |
+| **tool** | Tool call inputs, tool output, user-attached files, session titles | `--tools`, `--all` |
+| **noise** | Skill listings, `CLAUDE.md`, system reminders, hook output, token reminders, file-history snapshots, queue operations | `--all` |
+
+**Prose is the default**, because the question a history search answers is
+"where did we talk about this?" — and tool output is full of incidental
+mentions, where an `ls` of a directory whose name contains the term matches
+every time. Widen deliberately: `--tools` for "which session *did* this work?",
+`--all` for a literal file search. When sessions are hidden, the count and the
+flag that would reveal them are reported on stderr.
 
 ### Examples
 
@@ -89,9 +117,45 @@ cc-search "deploy" -c 10
 # Include subagent sessions (normally filtered out)
 cc-search "test failure" --include-agents
 
+# Find where the work on a topic actually happened, not what mentioned it last
+cc-search "Acme" --sort hits
+
+# Widen past prose to tool calls and tool output
+cc-search "Acme" --tools
+
+# Literal file search, boilerplate and all (the pre-tier behaviour)
+cc-search "Acme" --all
+
 # Show the top 5 most recent sessions mentioning two terms
 cc-search "docker" "compose" -n 5
 ```
+
+### Reading the banner
+
+The `>>` banner is written to **stderr**, before *and* after the results:
+
+```
+>> Searching for: Acme
+>> 111 sessions, 413 hits in prose (134 user, 279 asst)
+>> Showing 20 of 111, most recent first | --sort hits for densest first -> "Sales invoice report from Acme" (22 hits)
+>> Hid 451 session(s) matching only in tool calls, tool output or boilerplate (--tools / --all to widen)
+```
+
+Both placements are deliberate. `cc-search "Acme" | head -40` truncates stdout
+but not stderr, so the totals survive the pipe — and the leading copy means you
+see them even when `head` cuts the run short. Each line names the flag that
+changes it, and the `->` teaser names the session the *other* ordering would put
+first, so you can tell whether re-sorting is worth it without re-running.
+
+Per-session counts appear on the `MATCHES:` line:
+
+```
+MATCHES: [22 hits (1 user, 21 asst) - showing 3]
+```
+
+Hit kinds below the active tier are not listed, since they did not qualify the
+session: at the default you see `user`/`asst`, with `--tools` also `tool`, with
+`--all` also `boilerplate`.
 
 ## Output Format
 
@@ -144,7 +208,7 @@ The tool uses a two-phase approach optimized for speed:
 
 1. **Phase 1 — ripgrep file discovery**: For each search term, `rg --files-with-matches` scans all `.jsonl` files. Multiple terms are intersected sequentially (the result set shrinks with each term, so subsequent scans are faster).
 
-2. **Phase 2 — parallel Rust parsing**: Only the matched files are read and parsed. [Rayon](https://docs.rs/rayon) parallelizes this across CPU cores. Each session file is parsed once to extract metadata, timestamps, message counts, compaction status, and matching excerpts.
+2. **Phase 2 — parallel Rust parsing and tier filtering**: Only the matched files are read and parsed. [Rayon](https://docs.rs/rayon) parallelizes this across CPU cores. Each session file is parsed once to extract metadata, timestamps, message counts, compaction status, and matching excerpts. Ripgrep's file list is a *candidate* set: a candidate is dropped here if its only hit is below the requested match tier, which is what keeps injected boilerplate out of the results.
 
 ### Why ripgrep + Rust (not pure Rust)?
 
@@ -193,10 +257,12 @@ Sessions may be compacted multiple times in long-running conversations (tracked 
 The tool automatically filters out:
 
 - **Agent sessions** (`agent-*.jsonl`) unless `--include-agents` is passed
-- **Tool-only messages** (messages containing only `[tool: ...]` references)
+- **Noise-tier entries** (see [Match tiers](#match-tiers)) unless `--all` is passed — this is the main defence against false matches
+- **`<system-reminder>` spans** anywhere inside a user or assistant turn, not just at the start: the harness appends them to real messages, and they routinely carry the entire skill listing
 - **Task notifications** (`<task-notification>` prefixed messages)
-- **System reminders** (`<system-reminder>` prefixed messages)
 - **Compaction summaries** from first/last message display (the original user messages are shown instead)
+
+Matching excerpts are sorted strongest-evidence-first, so a prose hit is shown ahead of a tool-output hit from the same session.
 
 ## Performance
 

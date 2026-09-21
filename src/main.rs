@@ -35,9 +35,30 @@ struct Cli {
     #[arg(long)]
     include_agents: bool,
 
+    /// Result ordering: most recent session first, or most hits first
+    #[arg(long, value_enum, default_value_t = SortBy::Recency)]
+    sort: SortBy,
+
+    /// Also match tool calls, tool output and session titles, not just prose
+    #[arg(long)]
+    tools: bool,
+
+    /// Match anything in the transcript, including auto-injected boilerplate
+    /// (skill listings, CLAUDE.md, system reminders, hook output)
+    #[arg(long)]
+    all: bool,
+
     /// Custom Claude config directory
     #[arg(long)]
     claude_dir: Option<PathBuf>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
+enum SortBy {
+    /// Most recently active session first.
+    Recency,
+    /// Most matches first - finds where the work on a topic happened.
+    Hits,
 }
 
 // --- Data model ---
@@ -84,6 +105,67 @@ struct SessionInfo {
     compacted: bool,
     compaction_count: usize,
     matching_lines: Vec<MatchLine>,
+    hit_counts: HitCounts,
+}
+
+/// Every hit in a session, counted by kind. Uncapped, unlike the handful of
+/// excerpts actually displayed - the totals are what tell you whether a
+/// session is *about* the term or merely mentions it once.
+#[derive(Default, Clone, Copy)]
+struct HitCounts {
+    user: usize,
+    assistant: usize,
+    tool: usize,
+    noise: usize,
+}
+
+impl HitCounts {
+    fn prose(&self) -> usize {
+        self.user + self.assistant
+    }
+
+    /// Hits that count towards a match at the given tier.
+    fn at_or_above(&self, tier: Tier) -> usize {
+        match tier {
+            Tier::Prose => self.prose(),
+            Tier::Tool => self.prose() + self.tool,
+            Tier::Noise => self.prose() + self.tool + self.noise,
+        }
+    }
+
+    fn add(&mut self, tier: Tier, label: &str) {
+        match tier {
+            Tier::Prose if label == "user" => self.user += 1,
+            Tier::Prose => self.assistant += 1,
+            Tier::Tool => self.tool += 1,
+            Tier::Noise => self.noise += 1,
+        }
+    }
+
+    fn merge(&mut self, other: &HitCounts) {
+        self.user += other.user;
+        self.assistant += other.assistant;
+        self.tool += other.tool;
+        self.noise += other.noise;
+    }
+
+    /// "12 user, 9 asst, 3 tool" - omits kinds with no hits.
+    fn describe(&self, tier: Tier) -> String {
+        let mut parts = Vec::new();
+        if self.user > 0 {
+            parts.push(format!("{} user", self.user));
+        }
+        if self.assistant > 0 {
+            parts.push(format!("{} asst", self.assistant));
+        }
+        if tier <= Tier::Tool && self.tool > 0 {
+            parts.push(format!("{} tool", self.tool));
+        }
+        if tier == Tier::Noise && self.noise > 0 {
+            parts.push(format!("{} boilerplate", self.noise));
+        }
+        parts.join(", ")
+    }
 }
 
 struct MessageSnippet {
@@ -191,47 +273,224 @@ fn ripgrep_search(search_dir: &Path, terms: &[String], ignore_case: bool) -> Vec
     files
 }
 
-fn ripgrep_matching_lines(
-    file: &Path,
-    terms: &[String],
-    ignore_case: bool,
-    max_lines: usize,
-) -> Vec<String> {
-    if max_lines == 0 {
+// --- Match tiers ---
+//
+// A session .jsonl holds far more than the conversation: Claude Code injects
+// the skill listing, CLAUDE.md, hook output, token reminders and file-history
+// snapshots into every transcript. A plain substring hit on the file therefore
+// says nothing about whether the session was *about* the term - on one real
+// archive, searching for a customer name matched 978 files, 824 of which only
+// contained it inside an auto-injected `create-acme-invoice` skill description.
+//
+// Every entry is classified into a tier, and a session only counts as a match
+// if it has a hit at or above the requested tier.
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Tier {
+    /// Auto-injected boilerplate: skill listings, CLAUDE.md, system reminders,
+    /// hook output, token reminders, file-history snapshots.
+    Noise = 0,
+    /// What the session *did*: tool calls, tool output, session titles.
+    Tool = 1,
+    /// What was actually said: user prose, assistant prose, thinking.
+    Prose = 2,
+}
+
+/// Lowest tier a hit must reach for a session to be reported.
+///
+/// Prose is the default: the question a history search answers is "where did
+/// we talk about this?", and tool output is full of incidental mentions - an
+/// `ls` of a directory whose name contains the term matches every time.
+/// Widen deliberately with --tools, or --all for a literal file search.
+fn select_min_tier(all: bool, tools: bool) -> Tier {
+    match (all, tools) {
+        (true, _) => Tier::Noise,
+        (false, true) => Tier::Tool,
+        (false, false) => Tier::Prose,
+    }
+}
+
+/// A searchable fragment of one transcript entry.
+struct Fragment {
+    tier: Tier,
+    /// Display label, e.g. "user", "assistant", "tool", "skill_listing".
+    label: String,
+    text: String,
+}
+
+/// Attachment kinds that carry content the human chose to bring in, rather
+/// than boilerplate the harness injects on every turn.
+const MEANINGFUL_ATTACHMENTS: &[&str] = &[
+    "file",
+    "edited_text_file",
+    "queued_command",
+    "selected_lines_in_ide",
+    "new_diagnostics",
+];
+
+/// Remove `<system-reminder>...</system-reminder>` spans. These are injected
+/// into user turns by the harness and routinely carry the whole skill listing
+/// and CLAUDE.md, so a hit inside one is not a hit on anything the user wrote.
+fn strip_system_reminders(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(OPEN) {
+        out.push_str(&rest[..i]);
+        rest = match rest[i..].find(CLOSE) {
+            Some(j) => &rest[i + j + CLOSE.len()..],
+            // Unterminated reminder: drop everything after it.
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
+fn content_to_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+/// Split one transcript entry into searchable fragments with their tiers.
+fn classify_entry(raw: &serde_json::Value) -> Vec<Fragment> {
+    let entry_type = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Session titles describe the session as a whole - useful, but generated.
+    for key in ["customTitle", "aiTitle"] {
+        if let Some(t) = raw.get(key).and_then(|v| v.as_str()) {
+            return vec![Fragment {
+                tier: Tier::Tool,
+                label: "title".to_string(),
+                text: t.to_string(),
+            }];
+        }
+    }
+
+    if entry_type == "attachment" {
+        let kind = raw
+            .get("attachment")
+            .and_then(|a| a.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("attachment");
+        let tier = if MEANINGFUL_ATTACHMENTS.contains(&kind) {
+            Tier::Tool
+        } else {
+            Tier::Noise
+        };
+        let text = raw
+            .get("attachment")
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        return vec![Fragment {
+            tier,
+            label: kind.to_string(),
+            text,
+        }];
+    }
+
+    if entry_type != "user" && entry_type != "assistant" {
+        // system, file-history-snapshot, last-prompt, queue-operation, ...
+        return vec![Fragment {
+            tier: Tier::Noise,
+            label: entry_type.to_string(),
+            text: raw.to_string(),
+        }];
+    }
+
+    let Some(content) = raw.get("message").and_then(|m| m.get("content")) else {
         return vec![];
-    }
-
-    let rg = find_rg();
-    let mut cmd = Command::new(&rg);
-    cmd.arg("--no-filename")
-        .arg("--no-line-number")
-        .arg("--no-messages");
-    if ignore_case {
-        cmd.arg("-i");
-    }
-    cmd.arg(&terms[0]).arg(file);
-
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(_) => return vec![],
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let prose_label = entry_type.to_string();
+    let mut out = Vec::new();
 
-    stdout
-        .lines()
-        .filter(|line| {
-            terms[1..].iter().all(|t| {
-                if ignore_case {
-                    line.to_lowercase().contains(&t.to_lowercase())
-                } else {
-                    line.contains(t.as_str())
+    match content {
+        serde_json::Value::String(s) => {
+            let stripped = strip_system_reminders(s);
+            let was_stripped = stripped.len() != s.len();
+            if !stripped.trim().is_empty() {
+                out.push(Fragment {
+                    tier: Tier::Prose,
+                    label: prose_label.clone(),
+                    text: stripped,
+                });
+            }
+            if was_stripped {
+                out.push(Fragment {
+                    tier: Tier::Noise,
+                    label: "system-reminder".to_string(),
+                    text: s.clone(),
+                });
+            }
+        }
+        serde_json::Value::Array(blocks) => {
+            for block in blocks {
+                let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match btype {
+                    "text" | "thinking" => {
+                        let key = if btype == "text" { "text" } else { "thinking" };
+                        let Some(raw_text) = block.get(key).and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let stripped = strip_system_reminders(raw_text);
+                        if !stripped.trim().is_empty() {
+                            out.push(Fragment {
+                                tier: Tier::Prose,
+                                label: prose_label.clone(),
+                                text: stripped.clone(),
+                            });
+                        }
+                        if stripped.len() != raw_text.len() {
+                            out.push(Fragment {
+                                tier: Tier::Noise,
+                                label: "system-reminder".to_string(),
+                                text: raw_text.to_string(),
+                            });
+                        }
+                    }
+                    "tool_use" => {
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                        let input = block.get("input").map(|i| i.to_string()).unwrap_or_default();
+                        out.push(Fragment {
+                            tier: Tier::Tool,
+                            label: format!("tool:{}", name),
+                            text: input,
+                        });
+                    }
+                    "tool_result" => {
+                        let text = block.get("content").map(content_to_text).unwrap_or_default();
+                        out.push(Fragment {
+                            tier: Tier::Tool,
+                            label: "tool-out".to_string(),
+                            text,
+                        });
+                    }
+                    _ => {}
                 }
-            })
-        })
-        .take(max_lines * 5)
-        .map(String::from)
-        .collect()
+            }
+        }
+        _ => {}
+    }
+
+    out
+}
+
+fn fragment_matches(text: &str, terms: &[String], ignore_case: bool) -> bool {
+    if ignore_case {
+        let hay = text.to_lowercase();
+        terms.iter().all(|t| hay.contains(&t.to_lowercase()))
+    } else {
+        terms.iter().all(|t| text.contains(t.as_str()))
+    }
 }
 
 // --- Session parsing ---
@@ -271,6 +530,7 @@ fn parse_session(
     terms: &[String],
     ignore_case: bool,
     context_lines: usize,
+    min_tier: Tier,
 ) -> Option<SessionInfo> {
     // Session files can be nested below the project directory (subagent logs
     // live in <project>/<session-uuid>/subagents/agent-*.jsonl), so the project
@@ -303,8 +563,16 @@ fn parse_session(
     let mut ai_title: Option<String> = None;
     let mut cwd: Option<String> = None;
 
+    // Best tier seen anywhere in the session, plus the fragments to display.
+    let mut best_tier = Tier::Noise;
+    let mut hits: Vec<(Tier, MatchLine)> = Vec::new();
+    let mut hit_counts = HitCounts::default();
+
     for line in content.lines() {
-        let entry: JsonlEntry = match serde_json::from_str(line) {
+        let Ok(raw) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let entry: JsonlEntry = match serde_json::from_value(raw.clone()) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -338,10 +606,32 @@ fn parse_session(
         }
 
         // Extract cwd
-        if cwd.is_none() {
-            if let Ok(raw) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(c) = raw.get("cwd").and_then(|v| v.as_str()) {
-                    cwd = Some(c.to_string());
+        if cwd.is_none()
+            && let Some(c) = raw.get("cwd").and_then(|v| v.as_str())
+        {
+            cwd = Some(c.to_string());
+        }
+
+        // Collect matches from this entry, tier by tier. A cheap whole-line
+        // pre-check keeps the per-fragment work off the ~99% of lines that
+        // cannot match at all.
+        if fragment_matches(line, terms, ignore_case) {
+            for frag in classify_entry(&raw) {
+                if !fragment_matches(&frag.text, terms, ignore_case) {
+                    continue;
+                }
+                if frag.tier > best_tier {
+                    best_tier = frag.tier;
+                }
+                hit_counts.add(frag.tier, &frag.label);
+                if frag.tier >= min_tier && hits.len() < context_lines * 8 {
+                    hits.push((
+                        frag.tier,
+                        MatchLine {
+                            role: frag.label,
+                            text: find_match_context(&frag.text, terms, ignore_case, 150),
+                        },
+                    ));
                 }
             }
         }
@@ -397,65 +687,17 @@ fn parse_session(
         }
     }
 
-    // Get matching lines - prefer user/assistant text, fall back to any entry
-    let raw_matches = ripgrep_matching_lines(file, terms, ignore_case, context_lines);
-
-    // First pass: only user/assistant messages with real text
-    let mut matching_lines: Vec<MatchLine> = raw_matches
-        .iter()
-        .filter_map(|raw_line| {
-            let entry: JsonlEntry = serde_json::from_str(raw_line).ok()?;
-            let entry_type = entry.entry_type.as_deref()?;
-            if entry_type != "user" && entry_type != "assistant" {
-                return None;
-            }
-            let msg = entry.message.as_ref()?;
-            let role = msg.role.as_deref().unwrap_or("system");
-            let text = msg.content.as_ref().map(extract_text_content)?;
-            if text.is_empty() || text.starts_with("[tool:") {
-                return None;
-            }
-            if text.starts_with("<task-notification>") || text.starts_with("<system-reminder>") {
-                return None;
-            }
-
-            let display = find_match_context(&text, terms, ignore_case, 150);
-
-            Some(MatchLine {
-                role: role.to_string(),
-                text: display,
-            })
-        })
-        .take(context_lines)
-        .collect();
-
-    // Fallback: if no user/assistant matches, search the raw JSONL for context
-    if matching_lines.is_empty() {
-        matching_lines = raw_matches
-            .iter()
-            .filter_map(|raw_line| {
-                // Extract match context directly from the raw JSON line
-                let display = find_match_context(raw_line, terms, ignore_case, 150);
-                // Clean up JSON artifacts from the snippet
-                let display = display
-                    .replace("\\n", " ")
-                    .replace("\\t", " ")
-                    .replace("\\\"", "\"");
-                if display.is_empty() {
-                    return None;
-                }
-                let entry_type = serde_json::from_str::<JsonlEntry>(raw_line)
-                    .ok()
-                    .and_then(|e| e.entry_type)
-                    .unwrap_or_else(|| "?".to_string());
-                Some(MatchLine {
-                    role: entry_type,
-                    text: display,
-                })
-            })
-            .take(context_lines)
-            .collect();
+    // The file matched as raw text, but nothing at the requested tier did -
+    // the term only appears in boilerplate. Drop the session entirely rather
+    // than presenting an auto-injected skill listing as a "match".
+    if best_tier < min_tier {
+        return None;
     }
+
+    // Show the strongest evidence first: prose over tool traffic over noise.
+    hits.sort_by_key(|h| std::cmp::Reverse(h.0));
+    let matching_lines: Vec<MatchLine> =
+        hits.into_iter().map(|(_, m)| m).take(context_lines).collect();
 
     Some(SessionInfo {
         session_id,
@@ -474,6 +716,7 @@ fn parse_session(
         compacted,
         compaction_count,
         matching_lines,
+        hit_counts,
     })
 }
 
@@ -557,39 +800,42 @@ fn format_duration(first: &DateTime<Utc>, last: &DateTime<Utc>) -> String {
     }
 }
 
-fn display_session(session: &SessionInfo, index: usize) {
-    let divider = "─".repeat(80);
-    println!("{}", divider.dimmed());
+/// Render one session card as lines. Returns them rather than printing, so
+/// the caller decides what happens when stdout goes away mid-write.
+fn display_session(session: &SessionInfo, index: usize, min_tier: Tier) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("─".repeat(80).dimmed().to_string());
 
     // Header
     let title = session.custom_title.as_deref().unwrap_or("(no title)");
-    print!("{}  ", format!("#{}", index + 1).bold().cyan());
-    println!("{}", title.bold().white());
+    lines.push(format!(
+        "{}  {}",
+        format!("#{}", index + 1).bold().cyan(),
+        title.bold().white()
+    ));
 
     // Project + session ID
-    let project_display = pretty_project(&session.project);
-    println!(
+    lines.push(format!(
         "  {}  {}",
-        project_display.green(),
+        pretty_project(&session.project).green(),
         session.session_id.dimmed()
-    );
+    ));
 
     // CWD if different from project
     if let Some(ref cwd) = session.cwd {
-        println!("  {}", cwd.dimmed());
+        lines.push(format!("  {}", cwd.dimmed()));
     }
 
     // Timestamps + duration
     if let (Some(first), Some(last)) = (session.first_timestamp, session.last_timestamp) {
-        let duration = format_duration(&first, &last);
-        println!(
+        lines.push(format!(
             "  {} {} {} {}  {}",
             "from".dimmed(),
             format_timestamp(&first).yellow(),
             "to".dimmed(),
             format_timestamp(&last).yellow(),
-            format!("({})", duration).dimmed()
-        );
+            format!("({})", format_duration(&first, &last)).dimmed()
+        ));
     }
 
     // Stats
@@ -605,77 +851,100 @@ fn display_session(session: &SessionInfo, index: usize) {
     } else {
         "not compacted".dimmed().to_string()
     };
-
-    println!(
+    lines.push(format!(
         "  {} user / {} assistant msgs | {} entries | {}",
         session.user_msg_count.to_string().bold(),
         session.assistant_msg_count.to_string().bold(),
         session.total_entries,
         compact_str
-    );
+    ));
 
-    // First user message
-    if let Some(ref msg) = session.first_user_msg {
-        let ts_str = msg
-            .timestamp
-            .as_ref()
-            .map(format_timestamp)
-            .unwrap_or_default();
-        println!(
-            "  {} {} {}",
-            "FIRST:".blue().bold(),
-            ts_str.dimmed(),
-            msg.text
-        );
+    // First / last user message
+    for (label, msg) in [
+        ("FIRST:", &session.first_user_msg),
+        ("LAST: ", &session.last_user_msg),
+    ] {
+        if let Some(msg) = msg {
+            let ts_str = msg
+                .timestamp
+                .as_ref()
+                .map(format_timestamp)
+                .unwrap_or_default();
+            lines.push(format!(
+                "  {} {} {}",
+                label.blue().bold(),
+                ts_str.dimmed(),
+                msg.text
+            ));
+        }
     }
 
-    // Last user message
-    if let Some(ref msg) = session.last_user_msg {
-        let ts_str = msg
-            .timestamp
-            .as_ref()
-            .map(format_timestamp)
-            .unwrap_or_default();
-        println!(
-            "  {}  {} {}",
-            "LAST:".blue().bold(),
-            ts_str.dimmed(),
-            msg.text
-        );
-    }
-
-    // Matching lines
+    // Matching lines, headed by the full hit count for this session
     if !session.matching_lines.is_empty() {
-        println!("  {}", "MATCHES:".magenta().bold());
+        let shown = session.matching_lines.len();
+        let total = session.hit_counts.at_or_above(min_tier);
+        let noun = if total == 1 { "hit" } else { "hits" };
+        let breakdown = session.hit_counts.describe(min_tier);
+        let suffix = if total > shown {
+            format!("{} {} ({}) - showing {}", total, noun, breakdown, shown)
+        } else {
+            format!("{} {} ({})", total, noun, breakdown)
+        };
+        lines.push(format!(
+            "  {} {}",
+            "MATCHES:".magenta().bold(),
+            format!("[{}]", suffix).dimmed()
+        ));
         for m in &session.matching_lines {
             let role_tag = match m.role.as_str() {
                 "user" => "user".cyan().to_string(),
                 "assistant" => "asst".green().to_string(),
-                "progress" => "tool".yellow().to_string(),
-                "system" => "sys".dimmed().to_string(),
+                "title" => "title".blue().to_string(),
+                "tool-out" => "tool-out".yellow().to_string(),
+                other if other.starts_with("tool:") => other.yellow().to_string(),
                 other => other.dimmed().to_string(),
             };
-            println!("    [{}] {}", role_tag, m.text);
+            lines.push(format!("    [{}] {}", role_tag, m.text));
         }
     }
 
     // Resume command
     let resume_cwd = session.cwd.as_deref().unwrap_or("~");
-    if cfg!(target_os = "windows") {
-        println!(
+    lines.push(if cfg!(target_os = "windows") {
+        format!(
             "  {} cd /d {} & claude --resume {}",
             "RESUME:".dimmed(),
             resume_cwd,
             session.session_id.dimmed()
-        );
+        )
     } else {
-        println!(
+        format!(
             "  {} cd {} && claude --resume {}",
             "RESUME:".dimmed(),
             resume_cwd,
             session.session_id.dimmed()
-        );
+        )
+    });
+
+    lines
+}
+
+/// Write lines to stdout, reporting whether the reader is still there.
+///
+/// `cc-search ... | head -40` closes the pipe as soon as head has its 40
+/// lines. Rust ignores SIGPIPE and turns the resulting EPIPE into a panic
+/// from `println!`, which would splatter a backtrace across the results -
+/// so writes are checked and a closed pipe simply ends the listing.
+fn write_lines(lines: &[String]) -> bool {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for line in lines {
+        if writeln!(out, "{}", line).is_err() {
+            return false;
+        }
     }
+    out.flush().is_ok()
 }
 
 fn pretty_project(raw: &str) -> String {
@@ -689,7 +958,7 @@ fn pretty_project(raw: &str) -> String {
     let home = dirs_home();
     let home_str = home.to_string_lossy().replace(['/', '\\'], "-");
     // The prefix is "-" + home path with separators as dashes + "-"
-    // e.g. home=/Users/ville → prefix="-Users-ville-"
+    // e.g. home=/Users/jane → prefix="-Users-jane-"
     let prefix = if home_str.starts_with('-') {
         format!("{}-", home_str)
     } else {
@@ -736,6 +1005,8 @@ fn main() {
     }
 
     let ignore_case = !cli.case_sensitive;
+
+    let min_tier = select_min_tier(cli.all, cli.tools);
 
     // Filter by project if specified
     let search_dirs: Vec<PathBuf> = if let Some(ref proj_filter) = cli.project {
@@ -786,53 +1057,158 @@ fn main() {
         });
     }
 
-    eprintln!(
-        "{} Found {} matching sessions",
-        ">>".blue().bold(),
-        all_matches.len()
-    );
+    let candidate_count = all_matches.len();
 
     if all_matches.is_empty() {
+        eprintln!("{} Found 0 matching sessions", ">>".blue().bold());
         return;
     }
 
-    // Parse in parallel
+    // Parse in parallel. parse_session drops candidates whose only hit is
+    // below min_tier, so this is where boilerplate-only files fall away.
     let mut sessions: Vec<SessionInfo> = all_matches
         .par_iter()
-        .filter_map(|f| parse_session(f, &projects_dir, &cli.terms, ignore_case, cli.context_lines))
+        .filter_map(|f| {
+            parse_session(
+                f,
+                &projects_dir,
+                &cli.terms,
+                ignore_case,
+                cli.context_lines,
+                min_tier,
+            )
+        })
         .collect();
 
-    // Sort by last timestamp (most recent first)
-    sessions.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
+    let dropped = candidate_count - sessions.len();
 
-    // Display
+    if sessions.is_empty() {
+        eprintln!("{} Found 0 matching sessions", ">>".blue().bold());
+        if dropped > 0 {
+            eprintln!("{} {}", ">>".blue().bold(), widen_hint(min_tier, dropped));
+        }
+        return;
+    }
+
+    match cli.sort {
+        SortBy::Recency => sessions.sort_by_key(|s| std::cmp::Reverse(s.last_timestamp)),
+        SortBy::Hits => sessions.sort_by_key(|s| {
+            (
+                std::cmp::Reverse(s.hit_counts.at_or_above(min_tier)),
+                std::cmp::Reverse(s.last_timestamp),
+            )
+        }),
+    }
+
     let show_count = sessions.len().min(cli.max_results);
+
+    // The banner goes to stderr and is printed both before and after the
+    // results, so it survives `cc-search ... | head -40`: stdout is truncated
+    // by head, stderr is not. Without this, piping hides exactly the numbers
+    // you need to decide whether to re-sort or widen.
+    let banner = summary_banner(&sessions, min_tier, cli.sort, show_count, dropped);
+    for line in &banner {
+        eprintln!("{} {}", ">>".blue().bold(), line);
+    }
+
     for (i, session) in sessions.iter().take(show_count).enumerate() {
-        display_session(session, i);
+        if !write_lines(&display_session(session, i, min_tier)) {
+            break;
+        }
     }
+    write_lines(&["─".repeat(80).dimmed().to_string()]);
 
-    let divider = "─".repeat(80);
-    println!("{}", divider.dimmed());
-
-    if sessions.len() > show_count {
-        eprintln!(
-            "{} Showing {} of {} results (use -n to show more)",
-            ">>".blue().bold(),
-            show_count,
-            sessions.len()
-        );
+    // Repeated on stderr, so it survives the pipe that just closed.
+    for line in &banner {
+        eprintln!("{} {}", ">>".blue().bold(), line);
     }
+}
 
-    // Summary
-    let compacted_count = sessions.iter().filter(|s| s.compacted).count();
-    let total_msgs: usize = sessions.iter().map(|s| s.user_msg_count + s.assistant_msg_count).sum();
-    eprintln!(
-        "{} {} sessions, {} compacted, {} total messages",
-        ">>".blue().bold(),
+/// Hint naming the flag that would reveal the sessions filtered out.
+fn widen_hint(min_tier: Tier, dropped: usize) -> String {
+    let (where_, flag) = match min_tier {
+        Tier::Prose => ("tool calls, tool output or boilerplate", "--tools / --all"),
+        Tier::Tool => ("injected boilerplate (skill listings, CLAUDE.md)", "--all"),
+        Tier::Noise => return String::new(),
+    };
+    format!("Hid {dropped} session(s) matching only in {where_} ({flag} to widen)")
+}
+
+/// The stderr banner: what was found, what kind of hits, how it is ordered,
+/// and which flag changes each of those.
+fn summary_banner(
+    sessions: &[SessionInfo],
+    min_tier: Tier,
+    sort: SortBy,
+    show_count: usize,
+    dropped: usize,
+) -> Vec<String> {
+    let mut totals = HitCounts::default();
+    for s in sessions {
+        totals.merge(&s.hit_counts);
+    }
+    let total_hits: usize = sessions
+        .iter()
+        .map(|s| s.hit_counts.at_or_above(min_tier))
+        .sum();
+
+    let tier_name = match min_tier {
+        Tier::Prose => "prose",
+        Tier::Tool => "prose+tool",
+        Tier::Noise => "everything",
+    };
+
+    let mut lines = vec![format!(
+        "{} sessions, {} hits in {} ({})",
         sessions.len(),
-        compacted_count,
-        total_msgs
-    );
+        total_hits,
+        tier_name,
+        totals.describe(min_tier),
+    )];
+
+    let (sort_name, other) = match sort {
+        SortBy::Recency => ("most recent first", "--sort hits for densest first"),
+        SortBy::Hits => ("most hits first", "--sort recency for newest first"),
+    };
+
+    // Name the session the other ordering would surface, so the tradeoff is
+    // visible without re-running the search.
+    let top_other = match sort {
+        SortBy::Recency => sessions
+            .iter()
+            .max_by_key(|s| s.hit_counts.at_or_above(min_tier)),
+        SortBy::Hits => sessions.iter().max_by_key(|s| s.last_timestamp),
+    };
+    let teaser = match top_other {
+        Some(s) if sessions.len() > 1 => {
+            let title = s.custom_title.as_deref().unwrap_or("(no title)");
+            format!(
+                " -> \"{}\" ({} hits)",
+                truncate_clean(title, 48),
+                s.hit_counts.at_or_above(min_tier)
+            )
+        }
+        _ => String::new(),
+    };
+    lines.push(format!(
+        "Showing {} of {}, {} | {}{}",
+        show_count,
+        sessions.len(),
+        sort_name,
+        other,
+        teaser
+    ));
+
+    if dropped > 0 {
+        lines.push(widen_hint(min_tier, dropped));
+    }
+
+    let compacted = sessions.iter().filter(|s| s.compacted).count();
+    if compacted > 0 {
+        lines.push(format!("{compacted} of these sessions are compacted"));
+    }
+
+    lines
 }
 
 fn dirs_home() -> PathBuf {
@@ -841,4 +1217,244 @@ fn dirs_home() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
         .expect("Could not determine home directory (neither HOME nor USERPROFILE is set)")
+}
+
+// --- Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tiers(v: serde_json::Value) -> Vec<(Tier, String)> {
+        classify_entry(&v)
+            .into_iter()
+            .map(|f| (f.tier, f.label))
+            .collect()
+    }
+
+    fn best(v: serde_json::Value, term: &str) -> Option<Tier> {
+        classify_entry(&v)
+            .into_iter()
+            .filter(|f| fragment_matches(&f.text, &[term.to_string()], true))
+            .map(|f| f.tier)
+            .max()
+    }
+
+    #[test]
+    fn strips_a_system_reminder_span() {
+        assert_eq!(
+            strip_system_reminders("before <system-reminder>hidden</system-reminder> after"),
+            "before  after"
+        );
+    }
+
+    #[test]
+    fn strips_multiple_and_unterminated_reminders() {
+        assert_eq!(
+            strip_system_reminders("a<system-reminder>x</system-reminder>b<system-reminder>y"),
+            "ab"
+        );
+    }
+
+    #[test]
+    fn leaves_text_without_reminders_alone() {
+        assert_eq!(strip_system_reminders("plain text"), "plain text");
+    }
+
+    /// The bug: the injected skill listing mentions the term in every session.
+    #[test]
+    fn skill_listing_attachment_is_noise() {
+        let entry = json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "skill_listing",
+                "content": "- create-acme-invoice: Use when creating an invoice in Acme"
+            }
+        });
+        assert_eq!(best(entry, "acme"), Some(Tier::Noise));
+    }
+
+    #[test]
+    fn claude_md_instructions_attachment_is_noise() {
+        let entry = json!({
+            "type": "attachment",
+            "attachment": {"type": "instructions", "files": [{"content": "Acme is our biller"}]}
+        });
+        assert_eq!(best(entry, "acme"), Some(Tier::Noise));
+    }
+
+    #[test]
+    fn user_attached_file_counts_as_tool_tier() {
+        let entry = json!({
+            "type": "attachment",
+            "attachment": {"type": "file", "content": "Acme report"}
+        });
+        assert_eq!(best(entry, "acme"), Some(Tier::Tool));
+    }
+
+    #[test]
+    fn hook_and_history_entries_are_noise() {
+        for t in ["system", "file-history-snapshot", "last-prompt", "queue-operation"] {
+            let entry = json!({"type": t, "content": "Acme"});
+            assert_eq!(best(entry, "acme"), Some(Tier::Noise), "type={t}");
+        }
+    }
+
+    #[test]
+    fn user_prose_is_prose_tier() {
+        let entry = json!({
+            "type": "user",
+            "message": {"role": "user", "content": "let us invoice Acme today"}
+        });
+        assert_eq!(best(entry, "acme"), Some(Tier::Prose));
+    }
+
+    /// A term that appears only inside a system-reminder appended to a real
+    /// user turn must not be promoted to prose.
+    #[test]
+    fn term_only_inside_system_reminder_is_noise() {
+        let entry = json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "text", "text": "fix the build <system-reminder>skill: create-acme-invoice</system-reminder>"}
+            ]}
+        });
+        assert_eq!(best(entry.clone(), "acme"), Some(Tier::Noise));
+        assert_eq!(best(entry, "build"), Some(Tier::Prose));
+    }
+
+    #[test]
+    fn tool_use_input_and_tool_result_are_tool_tier() {
+        let call = json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls acme-hub"}}
+            ]}
+        });
+        assert_eq!(best(call, "acme"), Some(Tier::Tool));
+
+        let result = json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "content": [{"type": "text", "text": "acme-hub-db-1"}]}
+            ]}
+        });
+        assert_eq!(best(result, "acme"), Some(Tier::Tool));
+    }
+
+    #[test]
+    fn assistant_thinking_is_prose_tier() {
+        let entry = json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Acme is the biller here"}
+            ]}
+        });
+        assert_eq!(best(entry, "acme"), Some(Tier::Prose));
+    }
+
+    #[test]
+    fn session_title_is_tool_tier() {
+        let entry = json!({"type": "ai-title", "aiTitle": "Acme invoice run"});
+        assert_eq!(best(entry, "acme"), Some(Tier::Tool));
+    }
+
+    /// A turn mixing prose and tool traffic yields both, so the session is
+    /// ranked by its strongest evidence.
+    #[test]
+    fn mixed_turn_yields_both_tiers() {
+        let entry = json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Checking Acme"},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "acme"}}
+            ]}
+        });
+        let got = tiers(entry);
+        assert!(got.contains(&(Tier::Prose, "assistant".to_string())));
+        assert!(got.contains(&(Tier::Tool, "tool:Bash".to_string())));
+    }
+
+    #[test]
+    fn all_terms_must_match_one_fragment() {
+        let terms = vec!["acme".to_string(), "invoice".to_string()];
+        assert!(fragment_matches("Acme invoice draft", &terms, true));
+        assert!(!fragment_matches("Acme report", &terms, true));
+        assert!(!fragment_matches("Acme invoice", &terms, false));
+    }
+
+    #[test]
+    fn prose_is_the_default_tier() {
+        assert_eq!(select_min_tier(false, false), Tier::Prose);
+    }
+
+    #[test]
+    fn tools_flag_widens_to_tool_tier() {
+        assert_eq!(select_min_tier(false, true), Tier::Tool);
+    }
+
+    #[test]
+    fn all_flag_widens_to_noise_and_beats_tools() {
+        assert_eq!(select_min_tier(true, false), Tier::Noise);
+        assert_eq!(select_min_tier(true, true), Tier::Noise);
+    }
+
+    fn counts(user: usize, assistant: usize, tool: usize, noise: usize) -> HitCounts {
+        HitCounts { user, assistant, tool, noise }
+    }
+
+    #[test]
+    fn hit_counts_roll_up_by_tier() {
+        let c = counts(2, 3, 4, 5);
+        assert_eq!(c.at_or_above(Tier::Prose), 5);
+        assert_eq!(c.at_or_above(Tier::Tool), 9);
+        assert_eq!(c.at_or_above(Tier::Noise), 14);
+    }
+
+    /// The banner must not advertise hit kinds the active tier filtered out.
+    #[test]
+    fn describe_hides_kinds_below_the_active_tier() {
+        let c = counts(2, 3, 4, 5);
+        assert_eq!(c.describe(Tier::Prose), "2 user, 3 asst");
+        assert_eq!(c.describe(Tier::Tool), "2 user, 3 asst, 4 tool");
+        assert_eq!(c.describe(Tier::Noise), "2 user, 3 asst, 4 tool, 5 boilerplate");
+    }
+
+    #[test]
+    fn describe_omits_kinds_with_no_hits() {
+        assert_eq!(counts(0, 7, 0, 0).describe(Tier::Tool), "7 asst");
+        assert_eq!(counts(0, 0, 0, 0).describe(Tier::Noise), "");
+    }
+
+    #[test]
+    fn add_routes_each_fragment_to_its_kind() {
+        let mut c = HitCounts::default();
+        c.add(Tier::Prose, "user");
+        c.add(Tier::Prose, "assistant");
+        c.add(Tier::Tool, "tool:Bash");
+        c.add(Tier::Noise, "skill_listing");
+        assert_eq!((c.user, c.assistant, c.tool, c.noise), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn merge_accumulates_across_sessions() {
+        let mut total = counts(1, 2, 3, 4);
+        total.merge(&counts(10, 20, 30, 40));
+        assert_eq!((total.user, total.assistant, total.tool, total.noise), (11, 22, 33, 44));
+    }
+
+    #[test]
+    fn widen_hint_names_the_flag_that_reveals_hidden_sessions() {
+        assert!(widen_hint(Tier::Prose, 5).contains("--tools"));
+        assert!(widen_hint(Tier::Tool, 5).contains("--all"));
+        // Nothing is hidden at the widest tier, so there is nothing to hint.
+        assert_eq!(widen_hint(Tier::Noise, 0), "");
+    }
+
+    #[test]
+    fn tier_ordering_is_noise_lt_tool_lt_prose() {
+        assert!(Tier::Noise < Tier::Tool);
+        assert!(Tier::Tool < Tier::Prose);
+    }
 }
