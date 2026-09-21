@@ -593,16 +593,16 @@ fn parse_session(
             }
         }
 
-        if entry.entry_type.as_deref() == Some("custom-title") {
-            if let Some(title) = &entry.custom_title {
-                custom_title = Some(title.clone());
-            }
+        if entry.entry_type.as_deref() == Some("custom-title")
+            && let Some(title) = &entry.custom_title
+        {
+            custom_title = Some(title.clone());
         }
 
-        if entry.entry_type.as_deref() == Some("ai-title") {
-            if let Some(title) = &entry.ai_title {
-                ai_title = Some(title.clone());
-            }
+        if entry.entry_type.as_deref() == Some("ai-title")
+            && let Some(title) = &entry.ai_title
+        {
+            ai_title = Some(title.clone());
         }
 
         // Extract cwd
