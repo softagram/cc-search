@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use clap::Parser;
 use colored::Colorize;
 use rayon::prelude::*;
@@ -35,9 +35,15 @@ struct Cli {
     #[arg(long)]
     include_agents: bool,
 
-    /// Result ordering: most recent session first, or most hits first
-    #[arg(long, value_enum, default_value_t = SortBy::Recency)]
+    /// Result ordering: most hits first, or most recent match first
+    #[arg(long, value_enum, default_value_t = SortBy::Hits)]
     sort: SortBy,
+
+    /// Only count matches newer than this. Accepts a duration (30m, 2h, 7d,
+    /// 1h30m), an RFC3339 timestamp (2026-10-04T08:00:00Z), a date
+    /// (2026-10-04) or Unix seconds - like `docker logs --since`.
+    #[arg(long, value_name = "WHEN")]
+    since: Option<String>,
 
     /// Also match tool calls, tool output and session titles, not just prose
     #[arg(long)]
@@ -55,10 +61,101 @@ struct Cli {
 
 #[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
 enum SortBy {
-    /// Most recently active session first.
-    Recency,
     /// Most matches first - finds where the work on a topic happened.
     Hits,
+    /// Most recent match first.
+    ///
+    /// Keyed on when the term was last *mentioned*, not when the session was
+    /// last active. Those differ: on one archive 39 of 135 matching sessions
+    /// had a gap over a day between the two, and 17 over a week (worst case
+    /// 34 days), because a long-running session touched yesterday makes a
+    /// month-old mention look fresh.
+    Recency,
+}
+
+// --- --since parsing ---
+
+/// Parse a `--since` value into an absolute instant, `docker logs` style.
+///
+/// Accepts a duration relative to `now` (`30m`, `2h`, `7d`, `1h30m`), an
+/// RFC3339 timestamp, a bare date (local midnight), or Unix seconds.
+///
+/// Unlike Go's `time.ParseDuration`, which docker uses, `d` (days) and `w`
+/// (weeks) are accepted: a conversation archive is searched in days and weeks,
+/// and `--since 7d` beats making the user write `168h`.
+fn parse_since(value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err("empty --since value".to_string());
+    }
+
+    // Unix seconds: all digits, and long enough not to be a bare duration.
+    if v.len() >= 9 && v.bytes().all(|b| b.is_ascii_digit()) {
+        let secs: i64 = v.parse().map_err(|_| format!("bad Unix timestamp: {v}"))?;
+        return DateTime::from_timestamp(secs, 0)
+            .ok_or_else(|| format!("Unix timestamp out of range: {v}"));
+    }
+
+    // RFC3339 timestamp, e.g. 2026-10-04T08:00:00Z
+    if let Ok(dt) = v.parse::<DateTime<Utc>>() {
+        return Ok(dt);
+    }
+
+    // Bare date, e.g. 2026-10-04 -> local midnight, so "--since 2026-10-04"
+    // means what the user's calendar says rather than what UTC says.
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+        let naive = date.and_hms_opt(0, 0, 0).expect("midnight is a valid time");
+        return match Local.from_local_datetime(&naive).earliest() {
+            Some(local) => Ok(local.with_timezone(&Utc)),
+            None => Err(format!("ambiguous local date: {v}")),
+        };
+    }
+
+    // Duration, possibly compound: 1h30m, 2h, 7d, 90s, 3w
+    parse_duration(v)
+        .map(|secs| now - chrono::Duration::seconds(secs))
+        .ok_or_else(|| {
+            format!(
+                "cannot parse --since {v:?}; expected a duration (30m, 2h, 7d, 1h30m), \
+                 an RFC3339 timestamp, a date (YYYY-MM-DD) or Unix seconds"
+            )
+        })
+}
+
+/// Sum a compound duration like `1h30m` into seconds. Returns None on any
+/// unknown unit, missing unit, or empty input - no silent partial parses.
+fn parse_duration(v: &str) -> Option<i64> {
+    let mut total: i64 = 0;
+    let mut digits = String::new();
+    let mut saw_unit = false;
+
+    for ch in v.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        if digits.is_empty() {
+            return None; // unit with no number in front of it
+        }
+        let n: i64 = digits.parse().ok()?;
+        digits.clear();
+        let mult = match ch {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            'w' => 604_800,
+            _ => return None,
+        };
+        total = total.checked_add(n.checked_mul(mult)?)?;
+        saw_unit = true;
+    }
+
+    // Trailing digits mean a number with no unit, e.g. "30" or "1h30".
+    if !digits.is_empty() || !saw_unit {
+        return None;
+    }
+    Some(total)
 }
 
 // --- Data model ---
@@ -106,6 +203,8 @@ struct SessionInfo {
     compaction_count: usize,
     matching_lines: Vec<MatchLine>,
     hit_counts: HitCounts,
+    /// Timestamp of the newest qualifying hit - the key `--sort recency` uses.
+    last_hit: Option<DateTime<Utc>>,
 }
 
 /// Every hit in a session, counted by kind. Uncapped, unlike the handful of
@@ -308,6 +407,16 @@ fn select_min_tier(all: bool, tools: bool) -> Tier {
         (false, true) => Tier::Tool,
         (false, false) => Tier::Prose,
     }
+}
+
+/// Why a ripgrep candidate did not become a result. The two reasons need
+/// different advice, so they must not be lumped together: widening the tier
+/// cannot bring back a session excluded by `--since`.
+enum Dropped {
+    /// No match at all inside the --since window.
+    OutOfWindow,
+    /// Matched in the window, but only below the requested tier.
+    BelowTier,
 }
 
 /// A searchable fragment of one transcript entry.
@@ -531,7 +640,8 @@ fn parse_session(
     ignore_case: bool,
     context_lines: usize,
     min_tier: Tier,
-) -> Option<SessionInfo> {
+    since: Option<DateTime<Utc>>,
+) -> Result<SessionInfo, Dropped> {
     // Session files can be nested below the project directory (subagent logs
     // live in <project>/<session-uuid>/subagents/agent-*.jsonl), so the project
     // is the first path component under the projects directory — not the
@@ -541,13 +651,16 @@ fn parse_session(
         .ok()
         .and_then(|rel| rel.components().next())
         .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .or_else(|| {
-            Some(file.parent()?.file_name()?.to_string_lossy().to_string())
-        })?;
+        .or_else(|| Some(file.parent()?.file_name()?.to_string_lossy().to_string()))
+        .ok_or(Dropped::BelowTier)?;
 
-    let session_id = file.file_stem()?.to_string_lossy().to_string();
+    let session_id = file
+        .file_stem()
+        .ok_or(Dropped::BelowTier)?
+        .to_string_lossy()
+        .to_string();
 
-    let content = std::fs::read_to_string(file).ok()?;
+    let content = std::fs::read_to_string(file).map_err(|_| Dropped::BelowTier)?;
 
     let mut first_user_msg: Option<MessageSnippet> = None;
     let mut last_user_msg: Option<MessageSnippet> = None;
@@ -567,6 +680,8 @@ fn parse_session(
     let mut best_tier = Tier::Noise;
     let mut hits: Vec<(Tier, MatchLine)> = Vec::new();
     let mut hit_counts = HitCounts::default();
+    let mut last_hit: Option<DateTime<Utc>> = None;
+    let mut matched_in_window = false;
 
     for line in content.lines() {
         let Ok(raw) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -615,15 +730,32 @@ fn parse_session(
         // Collect matches from this entry, tier by tier. A cheap whole-line
         // pre-check keeps the per-fragment work off the ~99% of lines that
         // cannot match at all.
-        if fragment_matches(line, terms, ignore_case) {
+        // A --since window applies to the match, not the session: the unit of
+        // output is a session, but what qualifies it is a mention inside the
+        // window. An entry with no timestamp cannot be placed, so it is
+        // excluded while a window is active rather than silently assumed
+        // in-range.
+        let in_window = match since {
+            None => true,
+            Some(cutoff) => ts.is_some_and(|t| t >= cutoff),
+        };
+
+        if in_window && fragment_matches(line, terms, ignore_case) {
             for frag in classify_entry(&raw) {
                 if !fragment_matches(&frag.text, terms, ignore_case) {
                     continue;
                 }
+                matched_in_window = true;
                 if frag.tier > best_tier {
                     best_tier = frag.tier;
                 }
                 hit_counts.add(frag.tier, &frag.label);
+                if frag.tier >= min_tier
+                    && let Some(t) = ts
+                    && last_hit.is_none_or(|prev| t > prev)
+                {
+                    last_hit = Some(t);
+                }
                 if frag.tier >= min_tier && hits.len() < context_lines * 8 {
                     hits.push((
                         frag.tier,
@@ -690,8 +822,19 @@ fn parse_session(
     // The file matched as raw text, but nothing at the requested tier did -
     // the term only appears in boilerplate. Drop the session entirely rather
     // than presenting an auto-injected skill listing as a "match".
+    if !matched_in_window {
+        // With no window active, this means ripgrep matched raw bytes that no
+        // classified fragment contains - JSON escaping, or a field the
+        // classifier does not treat as searchable. That is a tier miss, not a
+        // time miss, and must not be reported as one.
+        return Err(if since.is_some() {
+            Dropped::OutOfWindow
+        } else {
+            Dropped::BelowTier
+        });
+    }
     if best_tier < min_tier {
-        return None;
+        return Err(Dropped::BelowTier);
     }
 
     // Show the strongest evidence first: prose over tool traffic over noise.
@@ -699,7 +842,7 @@ fn parse_session(
     let matching_lines: Vec<MatchLine> =
         hits.into_iter().map(|(_, m)| m).take(context_lines).collect();
 
-    Some(SessionInfo {
+    Ok(SessionInfo {
         session_id,
         project,
         file_path: file.to_path_buf(),
@@ -717,6 +860,7 @@ fn parse_session(
         compaction_count,
         matching_lines,
         hit_counts,
+        last_hit,
     })
 }
 
@@ -1008,6 +1152,17 @@ fn main() {
 
     let min_tier = select_min_tier(cli.all, cli.tools);
 
+    let since = match cli.since.as_deref() {
+        None => None,
+        Some(v) => match parse_since(v, Utc::now()) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("{}: {}", "error".red().bold(), e);
+                std::process::exit(2);
+            }
+        },
+    };
+
     // Filter by project if specified
     let search_dirs: Vec<PathBuf> = if let Some(ref proj_filter) = cli.project {
         match std::fs::read_dir(&projects_dir) {
@@ -1066,9 +1221,9 @@ fn main() {
 
     // Parse in parallel. parse_session drops candidates whose only hit is
     // below min_tier, so this is where boilerplate-only files fall away.
-    let mut sessions: Vec<SessionInfo> = all_matches
+    let outcomes: Vec<Result<SessionInfo, Dropped>> = all_matches
         .par_iter()
-        .filter_map(|f| {
+        .map(|f| {
             parse_session(
                 f,
                 &projects_dir,
@@ -1076,28 +1231,40 @@ fn main() {
                 ignore_case,
                 cli.context_lines,
                 min_tier,
+                since,
             )
         })
         .collect();
 
-    let dropped = candidate_count - sessions.len();
+    let mut dropped = DropCounts::default();
+    let mut sessions: Vec<SessionInfo> = Vec::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        match outcome {
+            Ok(s) => sessions.push(s),
+            Err(Dropped::OutOfWindow) => dropped.out_of_window += 1,
+            Err(Dropped::BelowTier) => dropped.below_tier += 1,
+        }
+    }
+    debug_assert_eq!(candidate_count, sessions.len() + dropped.total());
 
     if sessions.is_empty() {
         eprintln!("{} Found 0 matching sessions", ">>".blue().bold());
-        if dropped > 0 {
+        if dropped.total() > 0 {
             eprintln!("{} {}", ">>".blue().bold(), widen_hint(min_tier, dropped));
         }
         return;
     }
 
     match cli.sort {
-        SortBy::Recency => sessions.sort_by_key(|s| std::cmp::Reverse(s.last_timestamp)),
+        // Ties broken by recency of the match, so equal-hit sessions are
+        // still in a useful order rather than filesystem order.
         SortBy::Hits => sessions.sort_by_key(|s| {
             (
                 std::cmp::Reverse(s.hit_counts.at_or_above(min_tier)),
-                std::cmp::Reverse(s.last_timestamp),
+                std::cmp::Reverse(s.last_hit),
             )
         }),
+        SortBy::Recency => sessions.sort_by_key(|s| std::cmp::Reverse(s.last_hit)),
     }
 
     let show_count = sessions.len().min(cli.max_results);
@@ -1106,7 +1273,7 @@ fn main() {
     // results, so it survives `cc-search ... | head -40`: stdout is truncated
     // by head, stderr is not. Without this, piping hides exactly the numbers
     // you need to decide whether to re-sort or widen.
-    let banner = summary_banner(&sessions, min_tier, cli.sort, show_count, dropped);
+    let banner = summary_banner(&sessions, min_tier, cli.sort, show_count, dropped, since);
     for line in &banner {
         eprintln!("{} {}", ">>".blue().bold(), line);
     }
@@ -1124,14 +1291,46 @@ fn main() {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+struct DropCounts {
+    out_of_window: usize,
+    below_tier: usize,
+}
+
+impl DropCounts {
+    fn total(&self) -> usize {
+        self.out_of_window + self.below_tier
+    }
+}
+
 /// Hint naming the flag that would reveal the sessions filtered out.
-fn widen_hint(min_tier: Tier, dropped: usize) -> String {
-    let (where_, flag) = match min_tier {
-        Tier::Prose => ("tool calls, tool output or boilerplate", "--tools / --all"),
-        Tier::Tool => ("injected boilerplate (skill listings, CLAUDE.md)", "--all"),
-        Tier::Noise => return String::new(),
-    };
-    format!("Hid {dropped} session(s) matching only in {where_} ({flag} to widen)")
+fn widen_hint(min_tier: Tier, dropped: DropCounts) -> String {
+    let mut parts = Vec::new();
+
+    if dropped.out_of_window > 0 {
+        parts.push(format!(
+            "{} outside the --since window",
+            dropped.out_of_window
+        ));
+    }
+
+    if dropped.below_tier > 0 {
+        let (where_, flag) = match min_tier {
+            Tier::Prose => ("tool calls, tool output or boilerplate", "--tools / --all"),
+            Tier::Tool => ("injected boilerplate (skill listings, CLAUDE.md)", "--all"),
+            // Nothing is below the widest tier, so nothing can land here.
+            Tier::Noise => ("no qualifying match", "--since to widen"),
+        };
+        parts.push(format!(
+            "{} matching only in {} ({} to widen)",
+            dropped.below_tier, where_, flag
+        ));
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("Hid {}: {}", dropped.total(), parts.join("; "))
 }
 
 /// The stderr banner: what was found, what kind of hits, how it is ordered,
@@ -1141,7 +1340,8 @@ fn summary_banner(
     min_tier: Tier,
     sort: SortBy,
     show_count: usize,
-    dropped: usize,
+    dropped: DropCounts,
+    since: Option<DateTime<Utc>>,
 ) -> Vec<String> {
     let mut totals = HitCounts::default();
     for s in sessions {
@@ -1158,26 +1358,38 @@ fn summary_banner(
         Tier::Noise => "everything",
     };
 
+    let window = match since {
+        Some(cutoff) => format!(" since {}", format_timestamp(&cutoff)),
+        None => String::new(),
+    };
+    let plural = |n: usize, word: &str| {
+        if n == 1 {
+            format!("{n} {word}")
+        } else {
+            format!("{n} {word}s")
+        }
+    };
     let mut lines = vec![format!(
-        "{} sessions, {} hits in {} ({})",
-        sessions.len(),
-        total_hits,
+        "{}, {} in {}{} ({})",
+        plural(sessions.len(), "session"),
+        plural(total_hits, "hit"),
         tier_name,
+        window,
         totals.describe(min_tier),
     )];
 
     let (sort_name, other) = match sort {
-        SortBy::Recency => ("most recent first", "--sort hits for densest first"),
-        SortBy::Hits => ("most hits first", "--sort recency for newest first"),
+        SortBy::Hits => ("most hits first", "--sort recency for newest match first"),
+        SortBy::Recency => ("most recent match first", "--sort hits for densest first"),
     };
 
     // Name the session the other ordering would surface, so the tradeoff is
     // visible without re-running the search.
     let top_other = match sort {
+        SortBy::Hits => sessions.iter().max_by_key(|s| s.last_hit),
         SortBy::Recency => sessions
             .iter()
             .max_by_key(|s| s.hit_counts.at_or_above(min_tier)),
-        SortBy::Hits => sessions.iter().max_by_key(|s| s.last_timestamp),
     };
     let teaser = match top_other {
         Some(s) if sessions.len() > 1 => {
@@ -1199,7 +1411,7 @@ fn summary_banner(
         teaser
     ));
 
-    if dropped > 0 {
+    if dropped.total() > 0 {
         lines.push(widen_hint(min_tier, dropped));
     }
 
@@ -1384,6 +1596,115 @@ mod tests {
         assert!(!fragment_matches("Acme invoice", &terms, false));
     }
 
+    // --- --since parsing ---
+
+    fn now() -> DateTime<Utc> {
+        "2026-10-04T12:00:00Z".parse().expect("fixed instant")
+    }
+
+    #[test]
+    fn parses_simple_durations() {
+        for (input, secs) in [("90s", 90), ("30m", 1800), ("2h", 7200), ("7d", 604_800), ("3w", 1_814_400)] {
+            assert_eq!(parse_duration(input), Some(secs), "input={input}");
+        }
+    }
+
+    #[test]
+    fn parses_compound_durations() {
+        assert_eq!(parse_duration("1h30m"), Some(5400));
+        assert_eq!(parse_duration("1d12h"), Some(129_600));
+        assert_eq!(parse_duration("1w2d3h4m5s"), Some(788_645));
+    }
+
+    /// A partial parse would silently search the wrong window, so anything
+    /// malformed must fail outright rather than parse the prefix it likes.
+    #[test]
+    fn rejects_malformed_durations() {
+        for bad in ["", "30", "1h30", "h", "1x", "-5m", "m30", "1.5h", "1 h"] {
+            assert_eq!(parse_duration(bad), None, "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn since_duration_is_relative_to_now() {
+        assert_eq!(
+            parse_since("2h", now()).unwrap(),
+            "2026-10-04T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn since_accepts_rfc3339_timestamp() {
+        assert_eq!(
+            parse_since("2026-09-21T08:30:00Z", now()).unwrap(),
+            "2026-09-21T08:30:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    /// A bare date means midnight on the user's calendar, not UTC's - so the
+    /// parsed instant tracks the local offset rather than being 00:00Z.
+    #[test]
+    fn since_bare_date_is_local_midnight() {
+        let parsed = parse_since("2026-09-21", now()).unwrap();
+        let local_midnight = Local
+            .from_local_datetime(
+                &chrono::NaiveDate::from_ymd_opt(2026, 9, 21)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap();
+        assert_eq!(parsed, local_midnight.with_timezone(&Utc));
+    }
+
+    #[test]
+    fn since_accepts_unix_seconds() {
+        // 1760000000 = 2025-10-09T07:33:20Z
+        assert_eq!(
+            parse_since("1760000000", now()).unwrap(),
+            DateTime::from_timestamp(1_760_000_000, 0).unwrap()
+        );
+    }
+
+    /// Short all-digit input is a malformed duration, not a Unix timestamp -
+    /// treating "30" as 1970 would silently match the whole archive.
+    #[test]
+    fn since_rejects_bare_number_without_unit() {
+        assert!(parse_since("30", now()).is_err());
+        assert!(parse_since("", now()).is_err());
+        assert!(parse_since("banana", now()).is_err());
+        assert!(parse_since("2026-13-45", now()).is_err());
+    }
+
+    // --- drop accounting ---
+
+    /// The hint must not blame the tier for what the window excluded, since
+    /// --tools cannot bring those sessions back.
+    #[test]
+    fn widen_hint_separates_window_from_tier() {
+        let both = DropCounts { out_of_window: 685, below_tier: 8 };
+        let msg = widen_hint(Tier::Prose, both);
+        assert!(msg.contains("685 outside the --since window"), "{msg}");
+        assert!(msg.contains("8 matching only in"), "{msg}");
+        assert!(msg.contains("Hid 693"), "{msg}");
+
+        let window_only = DropCounts { out_of_window: 5, below_tier: 0 };
+        let msg = widen_hint(Tier::Prose, window_only);
+        assert!(msg.contains("--since window"), "{msg}");
+        assert!(!msg.contains("--tools"), "must not suggest --tools: {msg}");
+
+        assert_eq!(widen_hint(Tier::Prose, DropCounts::default()), "");
+    }
+
+    #[test]
+    fn hits_is_the_default_sort() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["cc-search", "term"]);
+        assert_eq!(cli.sort, SortBy::Hits);
+        assert!(cli.since.is_none());
+    }
+
     #[test]
     fn prose_is_the_default_tier() {
         assert_eq!(select_min_tier(false, false), Tier::Prose);
@@ -1446,10 +1767,11 @@ mod tests {
 
     #[test]
     fn widen_hint_names_the_flag_that_reveals_hidden_sessions() {
-        assert!(widen_hint(Tier::Prose, 5).contains("--tools"));
-        assert!(widen_hint(Tier::Tool, 5).contains("--all"));
+        let d = DropCounts { out_of_window: 0, below_tier: 5 };
+        assert!(widen_hint(Tier::Prose, d).contains("--tools"));
+        assert!(widen_hint(Tier::Tool, d).contains("--all"));
         // Nothing is hidden at the widest tier, so there is nothing to hint.
-        assert_eq!(widen_hint(Tier::Noise, 0), "");
+        assert_eq!(widen_hint(Tier::Noise, DropCounts::default()), "");
     }
 
     #[test]

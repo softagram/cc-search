@@ -72,10 +72,53 @@ cc-search [OPTIONS] <TERMS>...
 | `-c`, `--context-lines` | 3 | Number of matching message excerpts to show per session. |
 | `-p`, `--project` | all | Filter to sessions from a specific project (substring match on project directory name). |
 | `--include-agents` | off | Include subagent/agent sessions (excluded by default). |
-| `--sort` | `recency` | Result ordering: `recency` (most recently active first) or `hits` (most matches first). |
+| `--sort` | `hits` | Result ordering: `hits` (most matches first) or `recency` (most recent match first). |
+| `--since` | all time | Only count matches newer than this — a duration (`30m`, `2h`, `7d`, `1h30m`), an RFC3339 timestamp, a date (`2026-10-04`) or Unix seconds. |
 | `--tools` | off | Also match tool calls, tool output and session titles, not just prose. |
 | `--all` | off | Match anything in the transcript, including auto-injected boilerplate. |
 | `--claude-dir` | `~/.claude` | Override the Claude configuration directory. |
+
+#### Ordering, and the `--since` window
+
+**`hits` is the default ordering.** Recency answers "what did I touch last",
+which is not the same question as "where did the work on this happen". On one
+archive the session that built the tooling being searched for ranked **#64 of
+111** by recency — invisible at the default `-n 20` — while ranking #1 by hits.
+
+Hit count is not a proxy for session length: measured over 135 matching
+sessions, the correlation between hit count and session size was **0.10**. It
+measures topic concentration, not verbosity.
+
+`--sort recency` is keyed on **when the term was last mentioned**, not when the
+session was last active. Those differ more than you would expect: on that same
+archive, 39 of 135 matching sessions had a gap over a day between the two, and
+17 had a gap over a week (worst case 34 days), because a long-running session
+touched yesterday makes a month-old mention look fresh.
+
+`--since` narrows the window, `docker logs --since` style:
+
+```bash
+cc-search "deploy" --since 2h            # duration
+cc-search "deploy" --since 7d            # days and weeks are supported
+cc-search "deploy" --since 1h30m         # compound
+cc-search "deploy" --since 2026-10-01    # date, at local midnight
+cc-search "deploy" --since 2026-10-01T08:00:00Z
+cc-search "deploy" --since 1760000000    # Unix seconds
+```
+
+Two deliberate departures from docker:
+
+- **`d` and `w` are accepted.** Go's `time.ParseDuration`, which docker uses,
+  stops at hours. A conversation archive is searched in days and weeks, so
+  `--since 7d` beats making you write `168h`.
+- **A bare number is rejected.** `--since 30` is a duration missing its unit,
+  not a Unix timestamp from 1970 — silently matching the whole archive would be
+  worse than an error. Unix seconds need at least 9 digits.
+
+The window applies to the **match**, not to the session: a session qualifies if
+it was mentioned inside the window, and hit counts, excerpts and ordering all
+respect it. An entry carrying no timestamp cannot be placed, so it is excluded
+while a window is active rather than assumed in-range.
 
 #### Match tiers
 
@@ -117,8 +160,11 @@ cc-search "deploy" -c 10
 # Include subagent sessions (normally filtered out)
 cc-search "test failure" --include-agents
 
-# Find where the work on a topic actually happened, not what mentioned it last
-cc-search "Acme" --sort hits
+# Most recent mention first, instead of the default densest-first
+cc-search "Acme" --sort recency
+
+# Only what was discussed in the last week
+cc-search "Acme" --since 7d
 
 # Widen past prose to tool calls and tool output
 cc-search "Acme" --tools
@@ -137,9 +183,12 @@ The `>>` banner is written to **stderr**, before *and* after the results:
 ```
 >> Searching for: Acme
 >> 111 sessions, 413 hits in prose (134 user, 279 asst)
->> Showing 20 of 111, most recent first | --sort hits for densest first -> "Sales invoice report from Acme" (22 hits)
->> Hid 451 session(s) matching only in tool calls, tool output or boilerplate (--tools / --all to widen)
+>> Showing 20 of 111, most hits first | --sort recency for newest match first -> "Acme invoice run" (3 hits)
+>> Hid 451: 12 outside the --since window; 439 matching only in tool calls, tool output or boilerplate (--tools / --all to widen)
 ```
+
+The hidden count is split by reason, because the two need different advice:
+widening the tier cannot bring back a session the `--since` window excluded.
 
 Both placements are deliberate. `cc-search "Acme" | head -40` truncates stdout
 but not stderr, so the totals survive the pipe — and the leading copy means you
